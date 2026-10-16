@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+README.md
+house.zip
+*.log
