@@ -1,6 +1,7 @@
 # CRITICAL: set TensorFlow env vars BEFORE any tensorflow import.
 # TF_ENABLE_ONEDNN_OPTS=0 fixes a known Windows crash (process abort after first
 # prediction) caused by oneDNN custom operations in TF 2.x on native Windows.
+# Use direct assignment (not setdefault) so it overrides any pre-existing setting.
 import os as _os
 _os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 _os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -19,6 +20,7 @@ from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 BASE = Path(__file__).parent
+# Model artifacts produced by House_Price_Training.ipynb
 MODEL_PATH = BASE / "custom_hybrid_model.pkl"
 DNN_PATH   = BASE / "custom_hybrid_keras.keras"
 
@@ -27,7 +29,7 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-# ============================================================
+# ============================================================      
 # Load trained models - exit if not found
 # ============================================================
 if not MODEL_PATH.exists():
@@ -49,10 +51,16 @@ except Exception as exc:
     log.error("The file may be corrupted. Re-run House_Price_Training.ipynb to regenerate it.")
     sys.exit(1)
 
+# MUST set TF env vars BEFORE importing tensorflow to avoid session graph conflicts
+# in threaded Flask environments (TF 1.x sessions are not thread-safe).
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('TF_NUM_INTRAOP_THREADS', '4')
+os.environ.setdefault('TF_NUM_INTEROP_THREADS', '1')
+
 # Optional Keras DNN (saved by the same notebook). Without it the DNN slot
 # falls back to the average of the four tree models.
 model_dnn = None
-_dnn_lock = threading.Lock()
+_dnn_lock = threading.Lock()   # serialise DNN predictions (TF 1.x is not thread-safe)
 
 if DNN_PATH.exists():
     try:
@@ -85,6 +93,7 @@ except Exception as exc:
 def sanitize_categoricals(row: dict) -> dict:
     for col, known in KNOWN_CATEGORIES.items():
         if col in row and str(row[col]) not in known:
+            # Community 用 "Unknown" 而非训练集众数，避免引入偏向
             row[col] = "Unknown" if col == "Community" else CATEGORY_FALLBACK.get(col, "Unknown")
     return row
 
@@ -105,6 +114,7 @@ def handle_exception(e):
 # ============================================================
 SQM_TO_SQFT = 10.7639
 
+# Load community / locality / coordinate data from pre-processed detail CSV
 from comm_app_data import COMM_DATA, get_comm_price, get_loc_price, get_city_price, GLOBAL_MEAN
 
 LOCALITIES     = COMM_DATA['LOCALITIES']        # {区域: [商圈]}
@@ -149,6 +159,7 @@ def health():
 
 @app.route("/communities", methods=["GET"])
 def get_communities():
+    """Return list of community names for a given locality (商圈)."""
     locality = request.args.get("locality", "").strip()
     if not locality:
         return jsonify({"communities": []})
@@ -159,32 +170,39 @@ def get_communities():
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
+        log.info("=== predict: start ===")
         data = request.get_json(force=True)
-
         community = data.get("community", "").strip()
+        log.info("predict: community=%s", community)
+
+        # Resolve district + locality from community name if provided
         if community and community in COMM2DIST:
             city = COMM2DIST[community]
             locality = next(
                 (loc for loc, comms in COMMUNITIES.items()
                  if community in comms), LOC_FALLBACK
             )
+            log.info("predict: resolved city=%s locality=%s", city, locality)
         else:
             city     = data.get("city", "朝阳")
             locality = data.get("locality", LOC_FALLBACK)
             if locality not in KNOWN_LOCALITIES:
                 locality = LOC_FALLBACK
+            log.info("predict: fallback city=%s locality=%s", city, locality)
 
         lat, lon = CITY_COORDS.get(city, (39.9042, 116.4074))
-
-        # Community-level price statistics
-        cp = get_comm_price(community) if community else {}
-        lp = get_loc_price(locality)
-        city_mean = get_city_price(city)
 
         area_sqm    = float(data.get("area_sqm", 90))
         super_area  = area_sqm * SQM_TO_SQFT
         buildup     = super_area * 0.85
         carpet      = super_area * 0.70
+
+        # Pull community-level price statistics for prediction features
+        # This is the KEY fix: without these, the model has no direct signal of the
+        # community's price level and falls back to global/locality mean → large errors.
+        cp = get_comm_price(community) if community else {}
+        lp = get_loc_price(locality)
+        city_mean = get_city_price(city)
 
         row = {
             "ListingID":             "WEB-QUERY",
@@ -223,20 +241,29 @@ def predict():
 
         df_input = pd.DataFrame([row])
         X_p = preprocessor.transform(df_input)
+        log.info("predict: preprocessor done, X_p shape=%s", X_p.shape)
 
         v_xgb = model_xgb.predict(X_p)
+        log.info("predict: xgb done")
         v_lgb = model_lgb.predict(X_p)
+        log.info("predict: lgb done")
         v_gbr = model_gbr.predict(X_p)
+        log.info("predict: gbr done")
         v_et  = model_et.predict(X_p)
+        log.info("predict: et done")
         if model_dnn is not None:
             with _dnn_lock:
+                log.info("predict: dnn start")
                 v_dnn = model_dnn.predict(X_p, verbose=0).flatten()
+                log.info("predict: dnn done")
         else:
             v_dnn = (v_xgb + v_lgb + v_gbr + v_et) / 4.0
+            log.info("predict: using avg (no DNN)")
 
         pred_log = meta.predict(np.column_stack((v_xgb, v_lgb, v_gbr, v_et, v_dnn)))
         price    = float(np.expm1(pred_log)[0])
         price = max(200_000, min(price, 200_000_000))
+        log.info("predict: meta done, price=%.0f", price)
 
         return jsonify({
             "price_yuan":     round(price, 2),
@@ -246,9 +273,9 @@ def predict():
             "locality":       locality,
             "community":      community,
         })
+        log.info("=== predict: done ===")
 
     except Exception as exc:
-        log.exception("Prediction error")
         return jsonify({"error": str(exc)}), 500
 
 
