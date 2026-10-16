@@ -1,0 +1,15 @@
+{
+  "name": "House Price Evaluator",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "forwardPorts": [7860],
+  "portsAttributes": {
+    "7860": {
+      "label": "House app",
+      "onAutoForward": "openPreview",
+      "protocol": "http"
+    }
+  },
+  "postCreateCommand": "nohup python app.py > /tmp/house.log 2>&1 &"
+}
